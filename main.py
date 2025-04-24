@@ -10,8 +10,6 @@ import argparse
 import config
 import random
 import os
-import sys
-import platform
 import pickle
 import ntplib
 from webdriver_manager.chrome import ChromeDriverManager
