@@ -13,17 +13,41 @@ import os
 import sys
 import platform
 import pickle
+import ntplib
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.service import Service
 
 # 设置日志
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s.%(msecs)03d - %(levelname)s - %(message)s",
+    datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
 # 存储cookies的文件路径
 COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.pkl")
+MAX_NTP_RETRY = 5  # NTP时间同步最大重试次数
+NETWORK_DELAY = 0.3  # 预估网络延迟时间（秒）
+
+
+class TimeSync:
+    """网络时间同步工具类"""
+
+    @staticmethod
+    def get_network_time():
+        """获取NTP服务器时间"""
+        for _ in range(MAX_NTP_RETRY):
+            try:
+                client = ntplib.NTPClient()
+                response = client.request("pool.ntp.org", version=3)
+                return datetime.datetime.fromtimestamp(response.tx_time)
+            except Exception as e:
+                logger.warning(f"NTP同步失败: {str(e)}")
+                time.sleep(0.5)
+
+        logger.warning("无法获取网络时间，将使用本地时间")
+        return datetime.datetime.now()
 
 
 def save_cookies(driver):
@@ -136,25 +160,146 @@ def setup_driver():
     return driver
 
 
-def wait_for_time(target_time):
-    """等待直到目标时间"""
-    logger.info(f"等待抢单时间: {target_time}")
+def precise_wait(target_time):
+    """精准等待到目标时间（精确到毫秒）"""
+    logger.info(f"开始时间同步校准，目标时间: {target_time}")
+
+    try:
+        # 获取校准后的本地时间
+        network_time = TimeSync.get_network_time()
+        local_time = datetime.datetime.now()
+        time_diff = network_time - local_time
+        logger.info(
+            f"时间校准完成，网络时间与本地时间差: {time_diff.total_seconds():.3f}秒"
+        )
+    except Exception as e:
+        logger.error(f"时间同步失败: {str(e)}")
+        time_diff = datetime.timedelta(0)  # 无法同步则不做调整
 
     while True:
-        now = datetime.datetime.now()
-        if now >= target_time:
-            logger.info("到达抢单时间，开始抢单!")
-            break
+        calibrated_time = datetime.datetime.now() + time_diff
+        remaining = (target_time - calibrated_time).total_seconds() - NETWORK_DELAY
 
-        # 显示倒计时
-        time_left = (target_time - now).total_seconds()
-        if time_left > 60:
-            logger.info(f"距离抢单还有: {time_left/60:.1f}分钟")
-            time.sleep(30)  # 时间还早，休眠30秒
+        if remaining <= 0:
+            logger.info("到达抢单时间，开始操作！")
+            return
+
+        # 动态休眠控制
+        if remaining > 1:
+            sleep_time = min(remaining / 2, 1)
+            if int(remaining) % 10 == 0:  # 每10秒显示一次日志
+                logger.info(f"剩余时间 {remaining:.3f}s，休眠 {sleep_time:.3f}s")
+            time.sleep(sleep_time)
         else:
-            logger.info(f"距离抢单还有: {time_left:.1f}秒")
-            # 最后一分钟减少休眠时间，提高精度
-            time.sleep(0.1)
+            # 最后1秒使用忙等待保证精度
+            time.sleep(0.001)
+
+
+def optimized_refresh(driver):
+    """优化版页面刷新策略"""
+    try:
+        # 使用JavaScript直接刷新避免重新加载静态资源
+        driver.execute_script("location.reload(true);")
+
+        # 智能等待页面核心元素加载
+        WebDriverWait(driver, 1.5).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+        logger.debug("页面刷新完成")
+    except Exception as e:
+        logger.warning(f"页面刷新异常: {str(e)}")
+
+
+def intelligent_click(driver, selectors, timeout=0.3):
+    """智能点击策略（多选择器并行检测）"""
+    script = """
+    var selectors = arguments[0];
+    for(var i=0; i<selectors.length; i++){
+        var el = document.querySelector(selectors[i]);
+        if(el && el.offsetParent !== null){
+            el.click();
+            return selectors[i];
+        }
+    }
+    return false;
+    """
+    try:
+        result = driver.execute_script(script, selectors)
+        return result
+    except Exception as e:
+        logger.debug(f"JavaScript点击失败: {str(e)}")
+        return False
+
+
+def enhanced_grab(
+    driver, buy_selectors, submit_selectors, max_retries=20, retry_interval=0.03
+):
+    """增强版抢单核心逻辑"""
+    # 预热网络连接
+    try:
+        driver.execute_script("fetch('/')")
+    except:
+        pass
+
+    # 时间窗口参数
+    last_refresh = time.time()
+    purchase_button_clicked = False
+
+    for attempt in range(max_retries):
+        current_time = time.time()
+
+        # 如果未点击购买按钮，每0.5秒刷新页面
+        if not purchase_button_clicked and current_time - last_refresh > 0.5:
+            optimized_refresh(driver)
+            last_refresh = current_time
+
+        # 处理购买按钮点击
+        if not purchase_button_clicked:
+            clicked_selector = intelligent_click(driver, buy_selectors)
+            if clicked_selector:
+                logger.info(f"成功点击购买按钮！({clicked_selector})")
+                purchase_button_clicked = True
+                # 立即进行订单提交，不等待
+
+        # 如果已点击购买按钮，尝试提交订单
+        if purchase_button_clicked:
+            if handle_order_submission(driver, submit_selectors):
+                return True
+
+        # 随机化重试间隔
+        time.sleep(retry_interval * random.uniform(0.9, 1.1))
+
+        if attempt % 5 == 0:
+            logger.debug(f"抢单尝试 #{attempt+1}/{max_retries}")
+
+    logger.warning("抢单操作超时")
+    return False
+
+
+def handle_order_submission(driver, submit_selectors, timeout=3):
+    """处理订单提交环节"""
+    deadline = time.time() + timeout  # 3秒提交超时
+    while time.time() < deadline:
+        clicked_selector = intelligent_click(driver, submit_selectors)
+        if clicked_selector:
+            logger.info(f"订单提交成功！({clicked_selector})")
+            return True
+
+        # 检查是否跳转到支付页面
+        current_url = driver.current_url
+        if any(key in current_url for key in ["pay", "confirm", "buy", "order"]):
+            logger.info(f"检测到页面跳转: {current_url}")
+            return True
+
+        time.sleep(0.05)
+
+    return False
+
+
+def wait_for_time(target_time):
+    """等待直到目标时间"""
+    # 使用新的精准等待替代旧的等待方式
+    precise_wait(target_time)
 
 
 def try_click_button(driver, css_selector, wait_time=2):
@@ -175,49 +320,10 @@ def try_click_button(driver, css_selector, wait_time=2):
 
 def grab_order(driver, button_selectors, max_attempts=100, interval=0.1):
     """抢单主流程 - 先点击购买按钮，然后立即点击提交订单按钮"""
-    attempts = 0
-    success = False
-    purchase_button_clicked = False
-
-    while attempts < max_attempts and not success:
-        attempts += 1
-        if attempts % 10 == 0:
-            logger.info(f"抢单尝试 #{attempts}/{max_attempts}")
-
-        # 随机化间隔时间，模拟人类操作
-        actual_interval = interval * random.uniform(0.8, 1.2)
-
-        # 第一步：如果还没点击购买按钮，尝试点击购买按钮
-        if not purchase_button_clicked:
-            for selector in button_selectors:
-                if try_click_button(driver, selector):
-                    logger.info("成功点击购买按钮！")
-                    purchase_button_clicked = True
-                    # 立即尝试点击提交订单按钮，不等待
-                    break
-
-        # 第二步：如果已经点击了购买按钮，尝试点击提交订单按钮
-        if purchase_button_clicked:
-            for selector in config.SUBMIT_ORDER_SELECTORS:
-                if try_click_button(driver, selector):
-                    logger.info("成功点击提交订单按钮！")
-                    success = True
-                    break
-
-            # 检查URL是否变化或是否出现特定元素，判断是否进入下一步
-            current_url = driver.current_url
-            if (
-                "buy" in current_url
-                or "order" in current_url
-                or "confirm" in current_url
-            ):
-                logger.info(f"检测到URL变化: {current_url}")
-                # 可能需要继续检查订单提交状态
-
-        time.sleep(actual_interval)
-
-    logger.info(f"完成抢单流程，共尝试 {attempts} 次")
-    return success
+    # 使用增强版抢单逻辑替代原有逻辑
+    return enhanced_grab(
+        driver, button_selectors, config.SUBMIT_ORDER_SELECTORS, max_attempts, interval
+    )
 
 
 def parse_time(time_str):
@@ -256,14 +362,17 @@ def check_login_status(driver):
 
 
 def main():
+    # Global declaration needs to be at the beginning of the function
+    global NETWORK_DELAY
+
     # 直接定义URL和时间（硬编码）
     TARGET_URL = "https://detail.tmall.hk/hk/item.htm?from=cart&id=573515891033"
     # TARGET_URL = "https://detail.tmall.hk/hk/item.htm?from=cart&id=779887795782"
 
-    TARGET_TIME = datetime.datetime(2025, 4, 23, 20, 0, 0)
+    TARGET_TIME = datetime.datetime(2025, 4, 24, 15, 0, 0)
 
     # 添加特定的"立即购买"按钮选择器
-    SPECIFIC_BUY_BUTTON = ".QJEEHAN8H5--btn--b68f956b"
+    SPECIFIC_BUY_BUTTON = "a[title='立即购买']"
 
     # 仍然保留命令行参数解析，但以硬编码的值为默认值
     parser = argparse.ArgumentParser(description="淘宝/天猫自动抢单工具")
@@ -283,7 +392,14 @@ def main():
     parser.add_argument(
         "--clear-cookies", action="store_true", help="清除保存的登录状态后退出"
     )
+    parser.add_argument(
+        "--network-delay", type=float, help="网络延迟补偿(秒)", default=NETWORK_DELAY
+    )
     args = parser.parse_args()
+
+    # 设置网络延迟补偿
+    NETWORK_DELAY = args.network_delay
+    logger.info(f"设置网络延迟补偿为: {NETWORK_DELAY:.3f}秒")
 
     # 检查是否需要清除cookies
     if args.clear_cookies:
@@ -349,7 +465,12 @@ def main():
         wait_for_time(target_time)
 
         # 开始抢单
-        grab_order(driver, button_selectors, args.max_attempts, args.interval)
+        success = grab_order(driver, button_selectors, args.max_attempts, args.interval)
+
+        if success:
+            logger.info("抢单操作成功完成！请检查订单状态")
+        else:
+            logger.warning("抢单操作未成功完成，请手动检查")
 
         # 等待用户手动关闭
         logger.info(
